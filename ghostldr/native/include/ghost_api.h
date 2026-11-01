@@ -1,0 +1,568 @@
+/*
+ * Interface between the ghostldr core and its runtime extension.
+ *
+ * The extension (ghostldr/native/ext, built to build/ghostldr/ext.bin) is a
+ * second freestanding PIC image with the same compiler flags as the core.
+ * run.py serves it over TCP at boot; the core reads it (ext.c), places its
+ * code in executable memory, relocates it and calls ext_init(&api).  The
+ * extension reaches the core only through struct ghost_api, and hands back
+ * its HLE table in struct ext_exports.  The blob also carries the full
+ * NID -> name table the core resolves host imports with.
+ *
+ * Compatibility: the core and the extension are built from one tree.  The
+ * blob records GHOST_API_VERSION and GHOST_ABI (the Makefile's checksum of
+ * ghost.h and this header); the core refuses an extension built against
+ * other headers.  Add new ghost_api members at the end.
+ */
+#pragma once
+#include "ghost.h"
+
+#define GHOST_API_VERSION 2 /* 2: diag, arena_drop, arena_adopt, reclaim (1.0) */
+#ifndef GHOST_ABI
+#define GHOST_ABI 0u /* the Makefile passes the headers' checksum */
+#endif
+
+struct lib_title;
+struct bx_reclaim;
+
+struct ghost_api {
+    u32 version; /* GHOST_API_VERSION */
+    u32 size;    /* sizeof(struct ghost_api) */
+
+    /* core state: pointers to the core's globals (ext.h: g_ctx, K, ...) */
+    struct boot_ctx **ctx;   /* g_ctx */
+    struct kfuncs *k;        /* K, the libkernel functions */
+    struct module **modules; /* g_modules, the title's loaded modules */
+    struct module **main_mod; /* g_main_mod, the title executable */
+    u64 *reported_dmem;      /* g_reported_dmem (budget.c) */
+
+    /* logging (the extension has its own copy of rt.c: fmt, memcpy, ...) */
+    void (*logf)(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+    void (*log_hex)(const char *tag, const void *p, size_t n);
+
+    /* host (SWRR process) functions */
+    void *(*host_real)(const char *name);
+    void *(*host_real_in)(const char *modname, const char *name);
+    void *(*host_dlsym)(u32 handle, const char *name);
+    int (*host_module_handle)(const char *modname, u32 *out);
+    int (*host_find_module)(const char *name, u32 *handle_out);
+    u64 (*call_gadget6)(u64 fn, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6);
+
+    /* NIDs.  nid_to_name works only during boot (it returns NULL once the
+     * title's imports are resolved and the table is freed). */
+    const char *(*nid_to_name)(const char *nid);
+    void (*compute_nid)(const char *name, char out[12]);
+
+    /* memory */
+    void *(*page_alloc)(size_t size);
+    void (*page_free)(void *addr, size_t size);
+    void *(*direct_alloc)(size_t size, int prot, u64 fixed);
+    void (*direct_free)(void *addr);
+    void *(*arena_alloc)(size_t size);
+    char *(*arena_strdup)(const char *s);
+    void (*spin_lock)(volatile int *l);
+    void (*spin_unlock)(volatile int *l);
+
+    /* files: /app0 remapping, ghostfs (the title's files in SWRR saves) */
+    const char *(*remap_path)(const char *path, char *buf, size_t size);
+    int (*vfs_open)(const char *path, int flags, int mode);
+    s64 (*vfs_read)(int fd, void *buf, u64 n);
+    s64 (*vfs_lseek)(int fd, s64 off, int whence);
+    int (*vfs_close)(int fd);
+    int (*vfs_stat)(const char *path, void *st);
+    bool (*gfs_active)(void);
+    bool (*gfs_owns)(int fd);
+    int (*gfs_open)(const char *path, int flags, int *fd_out);
+    int (*gfs_close)(int fd);
+    int (*gfs_stat)(const char *path, void *st, int *rc);
+    s64 (*gfs_read)(int fd, void *buf, u64 n);
+    s64 (*gfs_pread)(int fd, void *buf, u64 n, s64 off);
+    s64 (*gfs_lseek)(int fd, s64 off, int whence);
+    int (*gfs_fstat)(int fd, void *st);
+    int (*gfs_getdents)(int fd, void *buf, int size);
+    int (*gfs_mount)(const char *dirname, int mode, u64 blocks, char mount_point[16]);
+    int (*gfs_umount)(const char mount_point[16], u32 max_ms);
+    const char *(*gfs_save_name)(void);
+
+    /* the title's modules, threads and TLS */
+    u64 (*module_export)(struct module *m, const char *nid);
+    struct module *(*ghost_main_module)(void);
+    int (*ghost_thread_create)(void *thr, const void *attr, void *(*fn)(void *), void *arg, const char *name);
+    void (*tls_ensure_thread)(void);
+    void *(*tls_get_addr)(void *ti);
+
+    /* executable memory and the JIT compiler process */
+    u64 (*jit_call)(u64 fn, u64 rax, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6);
+    int (*jit_copy_to)(u64 dst_in_compiler, const void *src, size_t len);
+    int (*arena_write)(u64 dst, const void *src, u64 size);
+    u64 (*stub_alloc_code)(const u8 *code, u32 len); /* 32-byte RX slot, written at stubs_flush */
+
+    /* the core's own overrides (an extension function may wrap one) */
+    u64 (*hle_lookup)(const char *lib, const char *name);
+
+    /* the title's identity and path namespace */
+    const char *(*title_id)(void); /* "CUSA11456" from the ghostfs index, "" when unknown */
+    /* remap_path asks fn about title paths starting with prefix; fn returns
+     * the host path (in buf) or NULL.  Only during ext_init (a family's init). */
+    int (*path_remap_add)(const char *prefix, const char *(*fn)(const char *path, char *buf, size_t size));
+    /* save data family (ext/src/hle_savedata.c): real save containers for a
+     * given user, real mount slots taken from ghostfs's data containers, the
+     * installed title's ID, and path translations ahead of remap_path's own */
+    int (*gfs_mount_user)(s32 user, const char *dirname, int mode, u64 blocks, char mount_point[16],
+                          u64 *required_blocks);
+    int (*gfs_slot_reserve)(void);
+    void (*gfs_slot_release)(void);
+    const char *(*gfs_title)(void);
+    int (*remap_hook_add)(const char *(*fn)(const char *path, char *buf, size_t size));
+    /* the title's modules after boot: load a prx (loader.c; *err an SCE
+     * kernel error) and start one at most once (modules.c) */
+    struct module *(*module_load_runtime)(const char *path, int *err);
+    int (*module_start)(struct module *m, u64 argc, const void *argp);
+    void (**thread_dtors)(void); /* the title libc's thread-exit hook (tls.c) */
+    /* a title thread created through real (a host function with
+     * scePthreadCreate's arguments), with its TLS block */
+    int (*ghost_thread_start)(void *real, void *thr, const void *attr, void *(*fn)(void *), void *arg,
+                              const char *name);
+    u32 (*profile_has)(u32 mask); /* the title profile's PF_* flags (profile.c) */
+    void (*tls_thread_exit)(void); /* a title thread ends: its TLS blocks go back (tls.c) */
+    u64 (*tls_thunk)(u64 fn);      /* fn behind a stub that gives the calling thread its TLS block */
+    /* flexible memory as the title gets it (budget.c): mapped from direct
+     * memory within the title's flexible budget, and a whole mapping given
+     * back (its budget too) */
+    int (*flex_map)(void **addr, size_t len, int prot, int flags);
+    int (*flex_unmap)(void *addr, size_t len);
+    /* app roots other than ghostfs (ext/src/approot.c):
+     * directory listings through ghostfs, another provider or the kernel
+     * (the game selector lists a library's title folders with it); the
+     * title's profile; a provider of /app0; saves in SWRR's containers */
+    int (*vfs_getdents)(int fd, void *buf, int size);
+    const char *(*profile_requested)(void);
+    void (*profile_select)(const char *title);
+    int (*appfs_register)(const struct appfs_ops *ops);
+    void (*gfs_use_saves)(const char *title, const char *prefix);
+    /* a descriptor of the JIT compiler process moved into this one
+     * (jitrpc.c; < 0 on errors).  The compiler keeps its own copy.  Like
+     * jit_call, only from the boot thread: the calls share one channel. */
+    int (*jit_recv_fd)(int compiler_fd);
+    /* the ELF loader (ext/src/elfldr_sys.c, docs/developers.md#the-elf-loader): Orbis modules
+     * parsed and their imports resolved as a title's are, published while
+     * they run; the RPC lock around every compiler call once payloads run
+     * (their sockets come from the compiler too); payload TLS and threads
+     * (tls.c); the emulator's JIT objects (arena.c, bigexec.c); and the
+     * crash handler's hook for a payload thread that faults (crash.c) */
+    int (*module_parse)(struct module *m, u8 *file, u64 size);
+    u64 (*resolve_import)(struct module *m, const char *encoded, bool weak, int kind);
+    void (*module_publish)(struct module *m);
+    void (*module_unpublish)(struct module *m);
+    u64 (*unresolved_stub)(const char *lib, const char *nid, const char *modname, s64 ret, bool denied);
+    void (*stubs_flush)(void);
+    void (*rpc_lock)(void);
+    void (*rpc_unlock)(void);
+    void (*tls_static_reserve)(u64 size, u64 align);
+    struct module *(*tls_owner)(void);
+    int (*payload_thread_start)(struct module *owner, void *thr, const void *attr, void *(*fn)(void *), void *arg,
+                                const char *name);
+    u32 (*arena_buffers)(u64 *start, u64 *end, u32 max);
+    int (*jit_objects_find)(struct jit_obj *o, u32 n, u32 want);
+    void (**payload_fault)(struct module *owner, int sig, u64 rip, u64 addr);
+    /* the games an app root that is a folder of games holds (a USB drive:
+     * ext/src/approot.c), as the game selector lists them:
+     * their count, 0 for none */
+    int (*library)(const struct lib_title **list);
+    /* ---- save tools: a profile's "save_tool" feature (PF_SAVE_TOOL, Apollo
+     * Save Tool) ----
+     * title_user is the core's g_title_user: the user whose saves the title
+     * works on (its user service answers, its save lists and mounts); 0: the
+     * user running SWRR.  The game selector sets it before the title loads.
+     * ghostldr's own containers and the title's <prefix>SAVE stay the SWRR
+     * user's. */
+    u32 *title_user;
+    /* The save tool's scan, before the title loads, while the game selector
+     * owns the screen; the core forwards it to the extension (struct
+     * ext_early.save_prescan; < 0 when it has none, or before title_pick).
+     * For user: DirNameSearch over every candidate title not fresh in its
+     * cache, progress(arg, done, total) once the candidates are known (done
+     * 0, may be left out) and after each title searched (nonzero: stop,
+     * keeping what was found), the cache written; returns the number of
+     * titles with saves, < 0 on errors. */
+    int (*save_prescan)(u32 user, int (*progress)(void *arg, u32 done, u32 total), void *arg);
+    /* The game selector's choice before it returns, so that save_prescan
+     * sees the title's files: the core mounts it as boot.c does after the
+     * selector (ghostfs's gfs_pick, a library's approot_pick; nothing when
+     * the core had the title already).  title and index as sel_main returns
+     * them.  Once: later calls return the first one's result.  0, or < 0
+     * (the boot then stops). */
+    int (*title_pick)(const char *title, int index);
+    /* ---- logs and failures ----
+     * The log's files and the failure screens' state, shared with the
+     * extension (log.c, fail.c; ext/src/logfile.c, failure.c).  NULL when
+     * the first log line could not map it. */
+    struct ghost_diag *(*diag)(void);
+    /* The emulator's JIT buffers for the reclaim (struct ext_early.reclaim):
+     * a buffer leaves the code region (arena.c arena_drop), and a fresh
+     * object becomes it (arena_adopt: mapped read-execute at [start, end),
+     * the compiler writes it at start + delta). */
+    void (*arena_drop)(u64 start);
+    int (*arena_adopt)(u64 start, u64 end, s64 delta);
+    /* The planner's reclaim (bigexec.c), which the extension does (its
+     * ext_early sets it; ext/src/reclaim.c) to keep the core small: 0, or
+     * < 0 with r->why said.  NULL: this extension has none. */
+    int (**reclaim)(struct bx_reclaim *r);
+    /* A community memory plan the game selector downloaded for the title it
+     * picks (plansync/): copied, and used beside the
+     * profile's REC_SEED records (profile.c profile_seed).  0, or < 0. */
+    int (*seed_add)(const char *title, const u8 fingerprint[20], u32 platform, u32 contributors, const void *plan,
+                    u32 size);
+    /* ---- back to the game selector (CTX_FLAG_RETURN, ext/src/title_back.c) ----
+     * Every thread the title made and ghostldr's own made for it (tls.c; at
+     * most max, ended ones included), and one of ghostldr's own added. */
+    u32 (*thread_list)(u64 *tids, const char **names, u32 max);
+    void (*thread_note)(u64 tid, const char *name);
+    /* ---- the game selector's refresh ----
+     * A library's games again (ext/src/approot.c): again nonzero looks at
+     * the USB drives again (one gone is forgotten, one plugged in since
+     * mounted) and lists the games in the same folder on each, in
+     * library()'s order, which the selector's choice indexes from then on;
+     * *ps5 (may be NULL) gets the PS5 games found and left out of it.  The
+     * count, or < 0 when this boot's games don't come from a folder of
+     * games (ghostfs, one title, or once the title is picked). */
+    int (*library_scan)(const struct lib_title **list, u32 *ps5, int again);
+    /* the title's direct allocations and flexible mappings (hle.c), for the
+     * crash screen's census of written memory (ext/src/failure.c) */
+    struct dm_usage *dm_usage;
+    u32 *dm_nusage;
+    /* the title profile's records of a kind (profile.c: a plan's only on its
+     * own build), for the plan's text patches (REC_PATCH, ext_main.c) */
+    const void *(*profile_record)(u32 kind, u32 n);
+    /* the core's crash handler asks this first about a fault (crash.c): 1, the
+     * swap file paged the address in (ext/src/swap.c); NULL when none */
+    int (**swap_fault)(u64 addr);
+    /* where a thread is parked for good, sleeping in the core's code (crash.c):
+     * back to the game selector (ext/src/title_back.c) sends a thread caught
+     * in a system library here instead of scePthreadExit, which libkernel
+     * aborts the process over when the thread is inside its lock code */
+    void (*park)(void);
+};
+
+/* A game found under an app root that is a folder of games (a USB drive, or
+ * a dev setup's folder), by its contents: a folder with eboot.bin, or one
+ * with app0/eboot.bin (ext/src/approot.c).  The game selector shows them in
+ * this order, and its choice comes back to approot_pick by index. */
+#define LIB_TITLE_BAD 1u /* can't be booted: note says why */
+#define LIB_TITLE_DUP 2u /* a second copy of a title: --title boots the first */
+struct lib_title {
+    char id[16];    /* param.sfo's TITLE_ID, meta.bin's, or the folder's name; "" when unknown */
+    char path[256]; /* its app0: the folder with eboot.bin */
+    u16 dir_len;    /* path's first dir_len bytes: its folder, with prefix and meta.bin (path's parent for .../app0) */
+    u16 flags;      /* LIB_TITLE_* */
+    u32 reserved;
+    char note[96];  /* why it can't be booted, or about the copy; may be empty */
+};
+
+/* A provider of the title's files other than ghostfs: the extension's usbfs
+ * (route B).  Registered with ghostfs.c (appfs_register), it
+ * answers every gfs_* call with ghostfs's contracts: open and stat return 1
+ * for paths that are not its own, fds are real placeholder fds, errors are
+ * SCE kernel errors. */
+struct appfs_ops {
+    u32 size;              /* sizeof(struct appfs_ops) */
+    const char *name;
+    int (*open)(const char *path, int flags, int *fd_out);
+    int (*stat)(const char *path, void *st, int *rc);
+    bool (*owns)(int fd);
+    int (*close)(int fd);
+    s64 (*read)(int fd, void *buf, u64 n);
+    s64 (*pread)(int fd, void *buf, u64 n, s64 off);
+    s64 (*lseek)(int fd, s64 off, int whence);
+    int (*fstat)(int fd, void *st);
+    int (*getdents)(int fd, void *buf, int size);
+    /* the title's app0 on the provider's volume ("/ghostldr/CUSA12345/app0"): 0, or an SCE error */
+    int (*set_root)(const char *path);
+};
+
+/* The extension's entry before the title's modules load (ext.c
+ * ext_approot_init): app roots on USB drives and folders of titles
+ * (ext/src/approot.c).  ext_init still runs at its usual place. */
+#define EXT_EARLY_MAGIC 0x594c5245u /* "ERLY" */
+struct ext_early {
+    u32 magic, size;
+    int (*approot_init)(const char **root);
+    /* the game the selector chose: its index in library()'s list and its ID
+     * (index < 0 or title NULL: none chosen) */
+    int (*approot_pick)(const char *title, int index, const char **root);
+    int (*library)(const struct lib_title **list);
+    /* A save tool's scan (ghost_api.save_prescan, same contract), once the
+     * title's root is mounted and before ext_init: only what ghost_api and
+     * the host's libraries give.  The core places the code for it when no
+     * app root did (ext.c).  NULL: none. */
+    int (*save_prescan)(u32 user, int (*progress)(void *arg, u32 done, u32 total), void *arg);
+    /* The FTP server while the game selector shows (ext/src/ftp_sys.c), on
+     * the boot thread: 0, or < 0 when it didn't start.  ftp_stop ends it
+     * before the code goes: 0, or < 0 when a thread of it is still running
+     * (then the code must stay).  NULL: none (the ELF loader's extension). */
+    int (*ftp_start)(u32 port);
+    int (*ftp_stop)(void);
+    /* The library's games again (ghost_api.library_scan, same contract):
+     * again nonzero looks at the drives again first.  NULL: none. */
+    int (*lib_again)(const struct lib_title **list, u32 *ps5, int again);
+};
+typedef const struct ext_early *(*ext_early_fn)(const struct ghost_api *api);
+
+/* The reclaim.  Every
+ * reference to the emulator's JIT buffers arena_buffers lists is dropped
+ * (descriptors in both processes, the compiler's mapping and the view here
+ * at each one's home), which gives their JIT memory back; then fresh
+ * objects are made: n for the module's code, of size[i] (obj[i]: where the
+ * compiler writes it, an RX alias of it here, not mapped yet), and one for
+ * the other modules of at least amin bytes and at most the largest buffer's
+ * size, mapped where that buffer was and adopted as the code region.  The
+ * other modules' object gets amin + BX_RECLAIM_ROOM first (prx loaded at run
+ * time), then the code objects grow over the text after them, each up to
+ * limit[i] (its read-only data: less direct memory), then it gets the rest.
+ * Nothing is dropped unless the JIT memory measured free plus the buffers
+ * holds it all.  The extension's own code is placed before (ext.c's early
+ * entry), in a block of its own. */
+#define BX_RECLAIM_MAX 6 /* bxplan.h BX_MAX_VIEWS */
+#define BX_RECLAIM_ROOM (8UL << 20)
+struct bx_reclaim {
+    const char *name; /* the module, for the log */
+    /* in: its code runs and data segments (bxplan.c), the end of its text,
+     * and what the other modules need (bxplan.c bx_pick's keep) */
+    struct bx_range runs[6], forbid[8];
+    u32 nruns, nforbid;
+    u64 text, keep;
+    /* out: n objects of size[i] at module offset off[i]; amin: the other
+     * modules' least (keep + a header, at least 1 MiB) */
+    u32 n;
+    s64 off[BX_RECLAIM_MAX];
+    u64 size[BX_RECLAIM_MAX], amin;
+    u64 limit[BX_RECLAIM_MAX]; /* the most size[i] may grow to (the next object's offset, or the text's end) */
+    struct jit_obj obj[BX_RECLAIM_MAX];
+    u64 free_before, free_after, arena; /* KiB-exact bytes, for the log and tools */
+    char why[240];   /* what went wrong, for the user */
+};
+
+/* ---- what the extension registers and returns ---- */
+
+/* One HLE function.  It matches an import by NID: the NID of name, or nid
+ * when given (functions whose name is unknown), and by library: lib or any
+ * alias a struct ext_lib declares for it.  name is also used in logs. */
+struct ext_hle_ent {
+    const char *lib;  /* import library, e.g. "libSceAudioOut" */
+    const char *name; /* function name, e.g. "sceAudioOutOpen"; may be NULL with nid */
+    void *fn;
+    const char *nid;  /* optional 11-character NID; NULL: computed from name */
+};
+
+/* Per-library policy.  Aliases are the library's other import names
+ * ("libSceNpManagerCompat libSceNpManagerForToolkit"): entries registered
+ * under any of the names match imports from all of them.  With
+ * EXT_LIB_NO_HOST an import the extension does not implement never falls
+ * back to SWRR's own library (its trophies, saves, NP state): it gets a stub
+ * that returns stub_ret.  stub_ret is also what the library's unresolved
+ * stubs return instead of 0. */
+#define EXT_LIB_NO_HOST 1u
+/* The extension is the whole module: sceKernelLoadStartModule of the
+ * library's .sprx gets a handle of the module family's (hle_module.c) and
+ * sceKernelDlsym on it finds the extension's functions, with no host module
+ * loaded (a library a PS4 app has on one console and not on another: Piglet) */
+#define EXT_LIB_VIRTUAL 2u
+struct ext_lib {
+    const char *name;    /* import library */
+    const char *aliases; /* other import library names, space separated, or NULL */
+    u32 flags;           /* EXT_LIB_* */
+    s32 stub_ret;        /* e.g. 0x80551622 (SCE_NP_TROPHY_ERROR_NOT_SUPPORTED) */
+};
+
+/* One per ext/src file (EXT_FAMILY / EXT_FAMILY_LIBS in ext.h). */
+struct ext_family {
+    const char *name;
+    const struct ext_hle_ent *hle;
+    u32 nhle, nlibs;
+    const struct ext_lib *libs;
+    int (*init)(void); /* optional; nonzero: the family's functions and policies are not used */
+    /* optional (EXT_FAMILY_HOOKS): a sysmodule load the title asked for failed */
+    void (*sysmodule_failed)(u32 id, s32 rc);
+};
+
+#define EXT_EXPORTS_MAGIC 0x32505845u /* "EXP2" */
+struct ext_exports {
+    u32 magic, size;
+    /* The function for an import of nid from lib (NULL: any library), or 0. */
+    u64 (*lookup)(const char *lib, const char *nid);
+    /* The policy covering lib (by name or alias), or NULL. */
+    const struct ext_lib *(*lib_policy)(const char *lib);
+    /* everything registered, for logs and tools: nid filled in */
+    const struct ext_hle_ent *hle;
+    u32 nhle, nfamilies, nlibs;
+    /* Tells the families that a sysmodule load the title asked for failed
+     * (hle.c; the core checks size before calling it). */
+    void (*sysmodule_failed)(u32 id, s32 rc);
+    /* The title's main thread is about to be created: the boot can no longer
+     * stop short (the FTP server starts here: ftp_sys.c).  The core checks
+     * size before calling it. */
+    void (*title_starting)(void);
+    /* No title (ctx CTX_FLAG_ELFLDR): the ELF loader serves payloads on the
+     * boot thread until a client tells it to quit (ext/src/elfldr.c).  The
+     * core checks size before calling it. */
+    int (*elfldr_main)(void);
+    /* A module's text, about to be written to executable memory (loader.c):
+     * the extension may patch it in place (raw system call sites, hle_rawsys.c).
+     * The core checks size before calling it. */
+    void (*patch_text)(struct module *m, u8 *text, u64 size);
+    /* The title registered display buffers (sceVideoOutRegisterBuffers,
+     * hle_sys.c; attr is its SceVideoOutBufferAttribute), and a pad state it
+     * read (scePadReadState, scePadRead) before it sees it: the extension
+     * draws dialogs over the first and takes the controller from the second
+     * while one is open (dlg_overlay.c).  The core checks size before calling
+     * them; NULL in an extension without drawn dialogs. */
+    void (*video_buffers)(s32 handle, s32 start, const u64 *addrs, s32 num, const void *attr);
+    void (*pad_state)(s32 handle, u8 *data);
+    /* The watchdog's reads of Ghost of Tsushima 2.18's globals (profile
+     * flag PF_DIAG; ext/src/ghost_watch.c): crash.c calls it with phase 0, 1
+     * and 2 between its own lines, with the core image's range for naming
+     * addresses.  The core checks size before calling it; NULL in the ELF
+     * loader's extension. */
+    void (*title_watch)(u64 eboot, u32 phase, u64 core_lo, u64 core_hi);
+    /* CTX_FLAG_RETURN (ext/src/title_back.c): on the boot thread once the
+     * title runs, until it ends (it quit, it crashed, or L1+R1+Options+
+     * touchpad on the controller); then its threads are stopped and what it
+     * held goes back (handles, mounts, executable memory), and 0 is returned
+     * for the core to give back the rest.  The core checks size before
+     * calling it; NULL in the ELF loader's extension. */
+    int (*title_back)(void);
+};
+
+typedef const struct ext_exports *(*ext_init_fn)(const struct ghost_api *api);
+
+/* The core calls this after ext_init: it checks the extension's relocated
+ * data, its bss and a call back into the core, and the lookups by name, by
+ * NID only and through an alias.  fn(seed) returns
+ * EXT_SELFTEST_OK ^ seed ^ (call number << 32). */
+#define EXT_SELFTEST_LIB "libGhostldrExt"
+#define EXT_SELFTEST_ALIAS "libGhostldrExtAlias"
+#define EXT_SELFTEST_NAME "ghostldrExtSelfTest"
+#define EXT_SELFTEST_NID "KGH3R7sRA84" /* "ghostldrExtSelfTestByNid", a name in no list */
+#define EXT_SELFTEST_STUB_RET ((s32)0x8002002D) /* the library's stub value (EOPNOTSUPP) */
+#define EXT_SELFTEST_OK 0x5e1f7e57ULL
+
+/* ---- build/ghostldr/ext.bin (tools/mkext.py) ----
+ * [struct ext_blob][image][relocations][NID keys][name offsets][names]
+ * Offsets are from the start of the blob. */
+#define EXT_BLOB_MAGIC 0x5458455244484c47ULL /* "GHLDREXT" */
+#define EXT_BLOB_FORMAT 1
+
+struct ext_blob {
+    u64 magic;
+    u32 format;      /* EXT_BLOB_FORMAT */
+    u32 header_size; /* sizeof(struct ext_blob) */
+    u32 api_version; /* GHOST_API_VERSION it was built against */
+    u32 abi;         /* GHOST_ABI it was built against */
+    u64 blob_size;
+    /* code: a flat image, [text | data], linked at 0 (ext/ext.ld) */
+    u32 image_off;
+    u32 image_filesz; /* bytes stored; the rest of image_memsz is zero */
+    u32 image_memsz;  /* with bss, 16 KiB aligned */
+    u32 text_size;    /* executable part, 16 KiB aligned; RW data follows */
+    u32 entry;        /* ext_init */
+    u32 reloc_off, reloc_count;       /* struct ext_reloc[] */
+    u32 families_off, families_count; /* image offset of the family pointers (for tools) */
+    /* NID -> name, every known name: keys ascending */
+    u32 nid_count;
+    u32 nid_keys_off;  /* u64[nid_count]: a NID's 64-bit value (its 11 base64 digits) */
+    u32 nid_names_off; /* u32[nid_count]: offset of the name in the string pool */
+    u32 str_off, str_size;
+    u32 early_entry; /* ext_early (struct ext_early), valid with EXT_BLOB_EARLY */
+    u32 flags;       /* EXT_BLOB_* */
+};
+#define EXT_BLOB_EARLY 1u
+
+/* R_X86_64_RELATIVE: *(u64 *)(base + offset) = base + addend */
+struct ext_reloc {
+    u32 offset, addend;
+};
+
+/* ---- logs and failures (core log.c, fail.c, crash.c; ext/src/logfile.c,
+ * failure.c) ---- */
+#define LOG_TEMP "/temp0/ghostldr.log" /* every line, from the first one: wiped when the console restarts */
+#define LOG_TEMP_OLD "/temp0/ghostldr.1.log"
+#define LOG_TEMP_CAP (8u << 20)
+
+struct ghost_log_file {
+    int fd;         /* -1: none */
+    u32 lost;       /* a write failed and the file was closed: the drive went away */
+    u64 bytes;
+    char path[128]; /* the extension's: past its cap the file is renamed (.1) and started again */
+};
+
+/* A failure, as the screens say it (ext/src/failure.c's messages) */
+enum {
+    FAIL_NONE,
+    FAIL_BOOT,             /* none of these: the code */
+    FAIL_EXT,              /* the extension is missing or damaged (-7) */
+    FAIL_EXT_START,        /* the extension failed to start (-8) */
+    FAIL_NO_DRIVE,         /* usb: and no drive in the console */
+    FAIL_DRIVE_REFUSED,    /* the USB storage service refused the drive */
+    FAIL_NO_FOLDER,        /* usb:/FOLDER is not on the drive */
+    FAIL_NO_GAMES,         /* the drive (or folder) has no games */
+    FAIL_NOT_ON_DRIVE,     /* the game asked for is not on the drive */
+    FAIL_NO_TITLE_ID,      /* a game's folder names no title ID */
+    FAIL_NOTHING_INSTALLED,/* no game on a drive, none installed */
+    FAIL_NOT_INSTALLED,    /* the game asked for is not installed */
+    FAIL_INSTALL_INCOMPLETE,
+    FAIL_INSTALL_DAMAGED,
+    FAIL_FILE_MISSING,     /* note: a file the game needs is not there */
+    FAIL_FILE_READ,        /* note: it could not be read */
+    FAIL_ENCRYPTED,        /* note: it is encrypted (not a decrypted dump) */
+    FAIL_FILE_BAD,         /* note: it is not a PS4 executable the loader can use */
+    FAIL_MEMORY,           /* note: the memory plan: the game cannot fit */
+    FAIL_CODE_SPACE,       /* no executable memory for the game's code (-3) */
+    FAIL_LINK,             /* relocation failed (-4) */
+    FAIL_CODE_WRITE,       /* the code could not be written (-5) */
+    FAIL_THREAD,           /* the main thread was not created */
+    FAIL_CRASH,            /* at run time: the title crashed */
+    FAIL_EXIT,             /* it called _exit */
+    FAIL_RETURNED,         /* its entry returned */
+    FAIL_HANG,             /* it drew nothing new for a long time */
+    FAIL_NO_PICTURE,       /* it never drew anything */
+    FAIL_COUNT
+};
+
+struct ghost_diag {
+    u32 size;
+    volatile int lock;              /* while a line is written or a file swapped */
+    u8 drives;                      /* USB drives seen (the extension) */
+    u8 title;                       /* the title's main thread is about to start, or runs */
+    u8 reserved[6];
+    struct ghost_log_file f[2];     /* [0] LOG_TEMP; [1] this boot's file on a USB drive */
+    u64 start;                      /* f[0]'s size when this boot began */
+    u64 copied;                     /* f[0] up to here is in the drive's file too (attaching copies the rest) */
+    u64 since_sync;                 /* bytes written to the drive's file since its last fsync */
+    /* the extension's code: NULL once it is gone (ext.c) */
+    void (*sink)(const char *line, size_t n); /* takes the log's lines (lock held) */
+    void (*show)(u32 kind, s64 code);         /* a failure on the TV (FAIL_BOOT: code is ghost_boot's result) */
+    /* noted while booting (fail.c): the last module file that failed, and
+     * whether a failure's message was on the TV already */
+    u32 note, shown;
+    char note_path[256];            /* the file, title or folder; or a sentence for the user (bigexec.c's bx_why) */
+    char where[160];                /* where the log goes, for Settings and the messages */
+    /* at run time (crash.c): the crash, for the extension's screen */
+    volatile u32 crashed;           /* 1: reported */
+    s32 sig;
+    u64 rip, addr;
+    char at[96];                    /* the extension's: "eboot.bin+1234" */
+    /* CTX_FLAG_RETURN: the title's run is over (it quit or crashed, its
+     * screen was shown): the boot thread stops it (ext/src/title_back.c) */
+    volatile u32 back;
+};
+
+/* the state, from the extension (its api; NULL from an older core) */
+#define GHOST_DIAG(api) \
+    ((api)->size >= __builtin_offsetof(struct ghost_api, diag) + 8 && (api)->diag ? (api)->diag() : NULL)
+
+/* the core's side (log.c, fail.c): not for the extension, which has ghost_api */
+struct ghost_diag *log_diag(void);
+void fail_note(u32 kind, const char *path);  /* a title file the loader could not use (FAIL_FILE_*, FAIL_MEMORY) */
+int fail_result(int rc);                     /* a boot's result: a failure is said on the TV */
+void fail_title(u32 kind, s64 code);         /* the title's run ended (FAIL_RETURNED) */
+void fail_notify(const char *text);          /* a system notification */
