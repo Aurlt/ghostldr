@@ -1,3 +1,6 @@
+> [!NOTE]
+> **asylumexp** is the original owner of this project/repository. This is just an archive.
+
 # ghostldr
 
 ghostldr runs PS4 game dumps and OpenOrbis homebrew inside *Star Wars Racer Revenge* (SWRR) on a stock PS5. It uses [Luac0re](https://github.com/Gezine/Luac0re)'s userland exploit: no kernel exploit, no jailbreak.
